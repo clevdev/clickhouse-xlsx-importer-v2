@@ -96,11 +96,13 @@ public class XlsxParserService {
     private static class MetaCollector implements SheetContentsHandler {
         List<String> names, types;
         private List<String> current;
-        private int rowIdx = -1;
+        private int rowIdx   = -1;
+        private int maxRowSeen = -1;   // tracks the highest row index seen in the sheet
 
         @Override public void startRow(int r) { rowIdx = r; current = new ArrayList<>(); }
 
         @Override public void endRow(int r) {
+            if (r > maxRowSeen) maxRowSeen = r;
             if      (r == 0) { trimTrailing(current); names = new ArrayList<>(current); }
             else if (r == 1) { types = new ArrayList<>(current); }
         }
@@ -120,6 +122,12 @@ public class XlsxParserService {
             if (types.size() < names.size())
                 throw new ValidationException(
                     "Row 2 has fewer columns than row 1: " + types.size() + " vs " + names.size());
+            // Row indices are 0-based: row 0 = names, row 1 = types, row 2+ = data.
+            // If the highest row seen is < 2, the file has no data rows at all.
+            if (maxRowSeen < 2)
+                throw new ValidationException(
+                    "File contains no data rows. " +
+                    "Row 1 must be column names, row 2 must be types, row 3+ must be data.");
             log.info("xlsx meta parsed: {} columns", names.size());
             return new SheetMeta(names, new ArrayList<>(types.subList(0, names.size())));
         }

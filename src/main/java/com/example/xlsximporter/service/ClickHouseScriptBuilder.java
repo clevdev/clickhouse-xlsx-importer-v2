@@ -150,14 +150,22 @@ public class ClickHouseScriptBuilder {
         String base = ClickHouseTypeRegistry.extractBaseTypeLower(type)
                 .replaceAll("\\(.*\\)", "").trim();
         return switch (base) {
-            case "int8", "int16", "int32"        -> Integer.parseInt(raw.trim());
-            case "int64"                          -> Long.parseLong(raw.trim());
-            case "uint8", "uint16", "uint32"     -> Long.parseLong(raw.trim());
-            case "uint64"                         -> Long.parseUnsignedLong(raw.trim());
-            case "float32"                        -> Float.parseFloat(raw.trim());
-            case "float64"                        -> Double.parseDouble(raw.trim());
+            // ── Integer types ────────────────────────────────────────────────
+            // Strip thousands separators before parsing:
+            // Excel formats 1000000 as "1 000 000" or "1.000.000" in some locales.
+            case "int8", "int16", "int32"        -> Integer.parseInt(stripThousands(raw));
+            case "int64"                          -> Long.parseLong(stripThousands(raw));
+            case "uint8", "uint16", "uint32"     -> Long.parseLong(stripThousands(raw));
+            case "uint64"                         -> Long.parseUnsignedLong(stripThousands(raw));
+            // ── Float types ──────────────────────────────────────────────────
+            // Normalise decimal separator: "1,23" → "1.23"
+            case "float32"                        -> Float.parseFloat(normalizeNumber(raw));
+            case "float64"                        -> Double.parseDouble(normalizeNumber(raw));
+            // ── Decimal ──────────────────────────────────────────────────────
+            // Returned as String — ClickHouse JDBC converts with full precision server-side
+            case "decimal"                        -> normalizeDecimal(raw);
             case "bool", "boolean"               -> parseBool(raw);
-            default                              -> raw;  // String, UUID, FixedString, Decimal
+            default                              -> raw;  // String, UUID, FixedString
         };
     }
 
@@ -171,10 +179,57 @@ public class ClickHouseScriptBuilder {
             case "float32"                        -> 0.0f;
             case "float64"                        -> 0.0d;
             case "bool", "boolean"               -> false;
+            case "decimal"                        -> "0";
             case "date", "date32"                -> "1970-01-01";
             case "datetime", "datetime64"        -> "1970-01-01 00:00:00";
             default                              -> "";
         };
+    }
+
+    /**
+     * Strips thousands separators that Excel inserts for integer columns:
+     * <ul>
+     *   <li>{@code "1 000 000"} — space (common in Russian/European locales)</li>
+     *   <li>{@code "1\u00A0000"} — non-breaking space</li>
+     *   <li>{@code "1.000.000"} — dot used as thousands separator (German/Portuguese locale)</li>
+     * </ul>
+     * Note: dot-as-thousands-separator is only safe for integer types.
+     * For float/decimal use {@link #normalizeNumber} instead.
+     */
+    private String stripThousands(String raw) {
+        return raw.trim()
+                .replace("\u00A0", "")   // non-breaking space
+                .replace(" ", "")        // regular space
+                .replace(".", "");       // dot as thousands separator (integers only)
+    }
+
+    /**
+     * Normalises a floating-point string from Excel for ClickHouse:
+     * <ul>
+     *   <li>Strips space / non-breaking-space thousands separators</li>
+     *   <li>Replaces comma decimal separator with dot: {@code "1 234,56"} → {@code "1234.56"}</li>
+     * </ul>
+     */
+    private String normalizeNumber(String raw) {
+        return raw.trim()
+                .replace("\u00A0", "")
+                .replace(" ", "")
+                .replace(",", ".");
+    }
+
+    /**
+     * Normalises a Decimal string and validates it via {@link java.math.BigDecimal}
+     * to catch non-numeric values early with a clear error message.
+     */
+    private String normalizeDecimal(String raw) {
+        String cleaned = normalizeNumber(raw);
+        try {
+            new java.math.BigDecimal(cleaned);
+        } catch (NumberFormatException e) {
+            throw new com.example.xlsximporter.exception.ValidationException(
+                "Cannot parse '" + raw + "' as Decimal: normalised value is '" + cleaned + "'");
+        }
+        return cleaned;
     }
 
     private boolean parseBool(String raw) {

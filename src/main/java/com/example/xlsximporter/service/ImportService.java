@@ -132,6 +132,12 @@ public class ImportService {
             totalRows.addAndGet(batch.size());
         }
 
+        if (totalRows.get() == 0) {
+            throw new com.example.xlsximporter.exception.ValidationException(
+                "File contains no data rows. " +
+                "Row 1 must be column names, row 2 must be types, row 3+ must be data.");
+        }
+
         log.info("Import complete: table='{}', total_rows={}", tableName, totalRows.get());
 
         ImportLog saved = importLogRepository.save(ImportLog.builder()
