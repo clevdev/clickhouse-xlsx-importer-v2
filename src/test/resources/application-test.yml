@@ -1,0 +1,25 @@
+# Used by @SpringBootTest unit-level tests (no Testcontainers).
+# Testcontainers integration tests override these via @DynamicPropertySource.
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/importdb
+    username: postgres
+    password: postgres
+  jpa:
+    hibernate:
+      ddl-auto: none
+
+clickhouse:
+  node1:
+    url: jdbc:ch://localhost:8123/default
+    username: default
+    password: ""
+  node2:
+    url: jdbc:ch://localhost:8124/default
+    username: default
+    password: ""
+
+logging:
+  level:
+    root: WARN
+    com.example.xlsximporter: INFO
