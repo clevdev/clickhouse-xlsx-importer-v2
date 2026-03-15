@@ -3,7 +3,6 @@ package com.example.xlsximporter.service;
 import com.example.xlsximporter.dto.ImportResponse;
 import com.example.xlsximporter.dto.SheetMeta;
 import com.example.xlsximporter.exception.ImportException;
-import com.example.xlsximporter.exception.ValidationException;
 import com.example.xlsximporter.model.ImportLog;
 import com.example.xlsximporter.repository.ImportLogRepository;
 import com.example.xlsximporter.validation.XlsxValidator;
@@ -17,33 +16,32 @@ import org.springframework.web.multipart.MultipartFile;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Import pipeline — STREAMING variant (v2-opt).
  *
- * <h3>Pipeline flow</h3>
- * <pre>
- *   Pass 1: readMeta()    — reads only rows 0–1 (names + types) via SAX
- *                           validates DDL, runs CREATE TABLE on both nodes
- *   Pass 2: streamRows()  — rows 2…N delivered one-by-one via Consumer callback
- *                           accumulated into a batch of batchSize, then flushed
- *                           to ClickHouse; batch list is cleared and reused
- * </pre>
+ * <h3>Byte-array conversion</h3>
+ * The very first thing {@link #importFile} does is call {@code file.getBytes()} and
+ * convert the upload into a plain {@code byte[]}.  Every subsequent operation works
+ * with that array — the {@link MultipartFile} is never touched again.
  *
- * <h3>Memory at any point in time</h3>
- * <pre>
- *   SheetMeta (names + types)  :  O(columns)  — tiny
- *   Current batch              :  O(batchSize) — typically 1 000 rows ≈ 1–2 MB
- *   Total regardless of file   :  ~5–15 MB
- * </pre>
+ * <p>Reasons:
+ * <ul>
+ *   <li>The pipeline reads the file <em>twice</em> (pass 1 = meta, pass 2 = data rows).
+ *       {@code MultipartFile.getInputStream()} is not guaranteed to be re-readable
+ *       (some servlet containers back it with a single-use stream).</li>
+ *   <li>A {@code byte[]} can be wrapped in a {@code ByteArrayInputStream} any number
+ *       of times with zero I/O cost.</li>
+ *   <li>The array is the single source of truth for the entire import transaction —
+ *       no race conditions if the underlying temp file is cleaned up mid-request.</li>
+ * </ul>
  *
- * <h3>Trade-off vs v3</h3>
- * The file is read <em>twice</em> (once for meta, once for data).
- * For large files on slow storage this adds ~10–20 % time.
- * The gain is that zero rows are ever held in memory simultaneously,
- * which makes it viable even with heap as low as 256 MB.
+ * <h3>Memory note</h3>
+ * The {@code byte[]} itself holds the raw (compressed) xlsx bytes, which is roughly
+ * equal to the file size (100 MB file → ~100 MB array).  The SAX parser still reads
+ * from that array one row at a time, so the <em>additional</em> working memory remains
+ * O(batchSize) ≈ 1–2 MB.
  */
 @Slf4j
 @Service
@@ -66,12 +64,12 @@ public class ImportService {
             ImportLogRepository importLogRepository,
             @Qualifier("jdbcTemplateNode1") JdbcTemplate jdbcNode1,
             @Qualifier("jdbcTemplateNode2") JdbcTemplate jdbcNode2) {
-        this.parserService      = parserService;
-        this.validator          = validator;
-        this.scriptBuilder      = scriptBuilder;
+        this.parserService       = parserService;
+        this.validator           = validator;
+        this.scriptBuilder       = scriptBuilder;
         this.importLogRepository = importLogRepository;
-        this.jdbcNode1          = jdbcNode1;
-        this.jdbcNode2          = jdbcNode2;
+        this.jdbcNode1           = jdbcNode1;
+        this.jdbcNode2           = jdbcNode2;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -80,45 +78,55 @@ public class ImportService {
 
     public ImportResponse importFile(MultipartFile file, String tableName) {
 
-        // ── Pass 1: read header only (SAX, O(columns) memory) ─────────────────
-        SheetMeta meta = parserService.readMeta(file);
+        // ── Convert MultipartFile → byte[] ONCE ──────────────────────────────
+        // From this point on, 'file' is never used again.
+        // All parser calls receive 'fileBytes' and wrap it in ByteArrayInputStream.
+        final String originalFilename = file.getOriginalFilename();
 
-        // Validate column names, types — throws ValidationException → HTTP 400
+        // Validate extension before reading bytes — fail fast without loading the file
+        if (originalFilename == null
+                || (!originalFilename.endsWith(".xlsx") && !originalFilename.endsWith(".xlsm"))) {
+            throw new ImportException("Only .xlsx/.xlsm files accepted, got: " + originalFilename, null);
+        }
+
+        final byte[] fileBytes;
+        try {
+            fileBytes = file.getBytes();
+            log.debug("Read {} bytes from upload '{}'", fileBytes.length, originalFilename);
+        } catch (Exception e) {
+            throw new ImportException("Cannot read uploaded file: " + e.getMessage(), e);
+        }
+
+        // ── Pass 1: read header only (O(columns) memory) ─────────────────────
+        SheetMeta meta = parserService.readMeta(fileBytes);
+
         validator.validateMeta(meta, tableName);
 
-        // Prepare DDL and INSERT SQL once
-        String       createScript  = scriptBuilder.buildCreateScript(tableName, meta);
-        List<String> insertColumns = scriptBuilder.buildInsertColumns(meta);
-        String       insertSql     = scriptBuilder.buildInsertSql(tableName, insertColumns);
+        String        createScript  = scriptBuilder.buildCreateScript(tableName, meta);
+        List<String>  insertColumns = scriptBuilder.buildInsertColumns(meta);
+        String        insertSql     = scriptBuilder.buildInsertSql(tableName, insertColumns);
         LocalDateTime operationDttm = LocalDateTime.now();
 
         log.info("Import starting: table='{}', columns={}", tableName, meta.columnNames().size());
 
-        // Run CREATE TABLE on both nodes before streaming data
         executeDdl(tableName, createScript);
 
-        // ── Pass 2: stream data rows → flush in batches ───────────────────────
-        // Only ONE batch lives in memory at a time.
-        // The batch list is reused (cleared after flush) — no extra allocation.
-        List<Object[]>  batch     = new ArrayList<>(batchSize);
-        AtomicInteger   totalRows = new AtomicInteger(0);
+        // ── Pass 2: stream data rows → batch flush ────────────────────────────
+        List<Object[]> batch     = new ArrayList<>(batchSize);
+        AtomicInteger  totalRows = new AtomicInteger(0);
 
-        parserService.streamRows(file, meta.columnNames().size(), rawRow -> {
-
-            // Validate data row inline — throws ValidationException on bad cell
+        parserService.streamRows(fileBytes, meta.columnNames().size(), rawRow -> {
             validator.validateRow(rawRow, meta);
-
             List<Object> values = scriptBuilder.buildRowValues(rawRow, meta, operationDttm);
             batch.add(values.toArray());
 
             if (batch.size() >= batchSize) {
                 flushBatch(insertSql, batch, tableName);
                 totalRows.addAndGet(batch.size());
-                batch.clear();          // reuse the list — no GC pressure
+                batch.clear();
             }
         });
 
-        // Flush remaining rows
         if (!batch.isEmpty()) {
             flushBatch(insertSql, batch, tableName);
             totalRows.addAndGet(batch.size());
@@ -126,13 +134,12 @@ public class ImportService {
 
         log.info("Import complete: table='{}', total_rows={}", tableName, totalRows.get());
 
-        // ── Save import log ───────────────────────────────────────────────────
         ImportLog saved = importLogRepository.save(ImportLog.builder()
                 .tableName(tableName)
                 .operationDttm(operationDttm)
                 .rowsInserted(totalRows.get())
                 .processedByNode("Node1+Node2")
-                .sourceFilename(file.getOriginalFilename())
+                .sourceFilename(originalFilename)
                 .build());
 
         return ImportResponse.builder()
@@ -165,10 +172,6 @@ public class ImportService {
         }
     }
 
-    /**
-     * Sends a batch to Node1 (mandatory) and Node2 (best-effort).
-     * The same batch list is passed to both — no copy is made.
-     */
     private void flushBatch(String insertSql, List<Object[]> batch, String tableName) {
         try {
             jdbcNode1.batchUpdate(insertSql, batch);
