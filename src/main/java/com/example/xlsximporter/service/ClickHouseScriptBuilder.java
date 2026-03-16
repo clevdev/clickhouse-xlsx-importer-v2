@@ -4,7 +4,6 @@ import com.example.xlsximporter.config.ClickHouseProperties;
 import com.example.xlsximporter.dto.SheetMeta;
 import com.example.xlsximporter.validation.ClickHouseTypeRegistry;
 import com.example.xlsximporter.validation.DateParser;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 

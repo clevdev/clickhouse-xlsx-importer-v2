@@ -180,9 +180,43 @@ public class ImportService {
 
     private void flushBatch(String insertSql, List<Object[]> batch, String tableName) {
         try {
+            // DEBUG: log SQL and first row values before executing
+            // Helps diagnose "bad SQL grammar" / type mismatch errors
+            if (log.isDebugEnabled()) {
+                log.debug("[Node1] INSERT SQL: {}", insertSql);
+                if (!batch.isEmpty()) {
+                    Object[] firstRow = batch.get(0);
+                    StringBuilder sb = new StringBuilder("[Node1] First row values (")
+                            .append(firstRow.length).append(" cols):");
+                    for (int i = 0; i < firstRow.length; i++) {
+                        Object v = firstRow[i];
+                        sb.append("\n  [").append(i).append("] ")
+                          .append(v == null ? "NULL" : v.getClass().getSimpleName())
+                          .append(" = ")
+                          .append(v);
+                    }
+                    log.debug(sb.toString());
+                }
+            }
             jdbcNode1.batchUpdate(insertSql, batch);
             log.debug("Flushed {} rows to Node1 '{}'", batch.size(), tableName);
         } catch (Exception e) {
+            // Log full diagnostics at ERROR level so they appear regardless of log level
+            log.error("[Node1] batchUpdate failed on table '{}': {}", tableName, e.getMessage());
+            log.error("[Node1] INSERT SQL: {}", insertSql);
+            if (!batch.isEmpty()) {
+                Object[] firstRow = batch.get(0);
+                StringBuilder sb = new StringBuilder("[Node1] First row values (")
+                        .append(firstRow.length).append(" cols):");
+                for (int i = 0; i < firstRow.length; i++) {
+                    Object v = firstRow[i];
+                    sb.append("\n  [").append(i).append("] ")
+                      .append(v == null ? "NULL" : v.getClass().getSimpleName())
+                      .append(" = ")
+                      .append(v);
+                }
+                log.error(sb.toString());
+            }
             throw new ImportException(
                 "Batch insert failed on Node1 (import aborted): " + e.getMessage(), e);
         }
