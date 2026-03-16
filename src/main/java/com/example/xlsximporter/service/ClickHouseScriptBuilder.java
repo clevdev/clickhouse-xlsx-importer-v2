@@ -8,6 +8,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
+import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -187,43 +188,71 @@ public class ClickHouseScriptBuilder {
     }
 
     /**
-     * Strips thousands separators from integer strings.
-     * Handles: space, non-breaking space, dot (German), comma (English) as thousands sep.
+     * Strips thousands separators from integer strings using the configured locale.
+     */
+    /**
+     * Strips thousands separators from an integer string.
      */
     private String stripThousands(String raw) {
-        return raw.trim()
+        String s = raw.trim()
                 .replace("\u00A0", "")
                 .replace(" ", "")
-                .replace(".", "")
-                .replace(",", "");
+                .replace(",", "")
+                .replace(".", "");
+        try {
+            Long.parseLong(s);
+            return s;
+        } catch (NumberFormatException e) {
+            throw new com.example.xlsximporter.exception.ValidationException(
+                "Cannot parse '" + raw + "' as integer: cleaned value is '" + s + "'");
+        }
     }
 
     /**
-     * Normalises a floating-point or decimal string to dot-separated format
-     * by detecting which character is the decimal separator.
-     *
-     * <p>Handles all common Excel locale formats:
-     * <pre>
-     *   "1234.56"      → "1234.56"   (EN: dot = decimal)
-     *   "1,234.56"     → "1234.56"   (EN: comma = thousands, dot = decimal)
-     *   "1234,56"      → "1234.56"   (RU/EU: comma = decimal)
-     *   "1.234,56"     → "1234.56"   (DE: dot = thousands, comma = decimal)
-     *   "1 234,56"     → "1234.56"   (RU: space = thousands, comma = decimal)
-     *   "1 234.56"     → "1234.56"   (EN with space thousands)
-     *   "7,945.53"     → "7945.53"   (EN: comma = thousands, dot = decimal)
-     * </pre>
-     *
-     * <p>Detection rules (applied after stripping spaces):
-     * <ol>
-     *   <li>Both separators present — the one appearing last is the decimal separator.</li>
-     *   <li>Only comma present — if it appears exactly once and has ≤ 3 digits after it,
-     *       treat as decimal separator; otherwise treat as thousands separator and remove.</li>
-     *   <li>Only dot present — same logic as comma.</li>
-     *   <li>No separator — already a plain integer string.</li>
-     * </ol>
+     * Normalises a floating-point string ({@code Float32}, {@code Float64}) to dot-decimal format.
+     * Fractional digits are preserved exactly as in the source — no zeros added or removed.
      */
     private String normalizeNumber(String raw) {
-        // Strip whitespace separators first
+        return toPlainDecimalString(raw);
+    }
+
+    /**
+     * Normalises a {@code Decimal(p,s)} string preserving full precision.
+     * Fractional digits are preserved exactly as in the source — no zeros added or removed.
+     * Supports up to 38 significant digits ({@code Decimal(38,6)}).
+     */
+    private String normalizeDecimal(String raw) {
+        return toPlainDecimalString(raw);
+    }
+
+    /**
+     * Core normalisation: strips thousands separators and converts to dot-decimal format
+     * without modifying the fractional part in any way.
+     *
+     * <p>Rules:
+     * <ul>
+     *   <li>Whitespace (space, non-breaking space) — always removed (thousands separator)</li>
+     *   <li>Both {@code ,} and {@code .} present — the <em>last</em> one is decimal,
+     *       the earlier ones are thousands separators and are removed</li>
+     *   <li>Only {@code ,} — decimal if it appears exactly once with ≤ 3 digits after it,
+     *       otherwise thousands separator</li>
+     *   <li>Only {@code .} — same logic as comma</li>
+     * </ul>
+     *
+     * <p>The normalised string is validated via {@link java.math.BigDecimal} to catch
+     * non-numeric values early. The value is then returned as {@code bd.toPlainString()}
+     * which preserves <em>exactly</em> the digits present in the source:
+     * <pre>
+     *   "1234.5"       → "1234.5"        (fractional part unchanged)
+     *   "1234.56"      → "1234.56"
+     *   "1234.123456"  → "1234.123456"   (up to 6 decimal places kept as-is)
+     *   "1,234.56"     → "1234.56"       (comma=thousands removed)
+     *   "1.234,56"     → "1234.56"       (dot=thousands removed, comma→dot)
+     *   "7,945.53"     → "7945.53"
+     *   "1234"         → "1234"          (integer — no decimal point added)
+     * </pre>
+     */
+    private String toPlainDecimalString(String raw) {
         String s = raw.trim()
                 .replace("\u00A0", "")
                 .replace(" ", "");
@@ -232,53 +261,46 @@ public class ClickHouseScriptBuilder {
         int lastComma = s.lastIndexOf(',');
 
         if (lastDot >= 0 && lastComma >= 0) {
-            // Both present — whichever comes last is the decimal separator
+            // Both separators present — the last one is decimal
             if (lastDot > lastComma) {
-                // "1,234.56" — comma is thousands separator
-                s = s.replace(",", "");
+                s = s.replace(",", "");                   // "1,234.56"  → "1234.56"
             } else {
-                // "1.234,56" — dot is thousands separator
-                s = s.replace(".", "").replace(",", ".");
+                s = s.replace(".", "").replace(",", "."); // "1.234,56"  → "1234.56"
             }
         } else if (lastComma >= 0) {
-            // Only comma — check if it looks like a decimal separator:
-            // decimal if exactly one comma and ≤ 3 digits follow it
-            String afterComma = s.substring(lastComma + 1);
-            boolean looksLikeDecimal = s.indexOf(',') == lastComma   // only one comma
-                    && afterComma.length() <= 3
-                    && afterComma.chars().allMatch(Character::isDigit);
-            if (looksLikeDecimal) {
-                s = s.replace(",", ".");  // "1234,56" → "1234.56"
-            } else {
-                s = s.replace(",", "");   // "1,234,567" → "1234567"
-            }
+            // Only comma present — thousands separator if it appears exactly once
+            // AND exactly 3 digits follow it (e.g. "1,234"); decimal separator otherwise.
+            // We do NOT limit by ≤3 because decimal values like "1234,1234" (4 fractional
+            // digits) or Decimal(38,6) values must also be treated as decimal separators.
+            String beforeComma = s.substring(0, lastComma);
+            String afterComma  = s.substring(lastComma + 1);
+            boolean isThousands = s.indexOf(',') == lastComma          // only one comma
+                    && afterComma.length() == 3                         // exactly 3 digits after
+                    && afterComma.chars().allMatch(Character::isDigit)  // all digits
+                    && !beforeComma.isEmpty()                           // something before it
+                    && beforeComma.chars().allMatch(Character::isDigit);// all digits before too
+            s = isThousands ? s.replace(",", "") : s.replace(",", ".");
         } else if (lastDot >= 0) {
-            // Only dot — same logic
-            String afterDot = s.substring(lastDot + 1);
-            boolean looksLikeDecimal = s.indexOf('.') == lastDot
-                    && afterDot.length() <= 3
-                    && afterDot.chars().allMatch(Character::isDigit);
-            if (!looksLikeDecimal) {
-                s = s.replace(".", "");   // "1.234.567" → "1234567" (thousands only)
-            }
-            // else keep as-is: "1234.56"
+            // Only dot present — same logic: thousands if exactly 3 digits follow
+            String beforeDot = s.substring(0, lastDot);
+            String afterDot  = s.substring(lastDot + 1);
+            boolean isThousands = s.indexOf('.') == lastDot
+                    && afterDot.length() == 3
+                    && afterDot.chars().allMatch(Character::isDigit)
+                    && !beforeDot.isEmpty()
+                    && beforeDot.chars().allMatch(Character::isDigit);
+            if (isThousands) s = s.replace(".", "");
         }
 
-        return s;
-    }
-
-    /**
-     * Normalises a Decimal string and validates it via {@link java.math.BigDecimal}.
-     */
-    private String normalizeDecimal(String raw) {
-        String cleaned = normalizeNumber(raw);
+        // Validate via BigDecimal — toPlainString() returns exactly the digits
+        // that were in the source string, with no rounding, no zero-padding, no
+        // scientific notation.
         try {
-            new java.math.BigDecimal(cleaned);
+            return new java.math.BigDecimal(s).toPlainString();
         } catch (NumberFormatException e) {
             throw new com.example.xlsximporter.exception.ValidationException(
-                "Cannot parse '" + raw + "' as Decimal: normalised value is '" + cleaned + "'");
+                "Cannot parse '" + raw + "' as number: cleaned value is '" + s + "'");
         }
-        return cleaned;
     }
 
     private boolean parseBool(String raw) {
